@@ -1,162 +1,166 @@
-🚀 Data Engineering Project: Medallion Architecture on Databricks
+# Medallion Architecture Pipeline
+### Databricks · Delta Lake · AWS S3 · PySpark
 
-📌 Overview
+---
 
-This project implements a production-style data engineering pipeline using:
-	•	Databricks (Lakehouse)
-	•	Delta Lake
-	•	AWS S3 (data source)
-	•	Medallion Architecture (Bronze → Silver → Gold)
+## Overview
 
-The system transforms raw data into clean, validated, and analytics-ready datasets with support for incremental processing and orchestration-ready pipelines.
+A production-style data engineering pipeline implementing the Medallion Architecture (Bronze → Silver → Gold) on Databricks. Raw data ingested from AWS S3 is progressively refined across three layers — from untouched source records to validated, modeled, analytics-ready datasets — with full support for incremental processing, idempotent ingestion, and data quality enforcement.
 
-⸻
+---
 
-🧠 Architecture
+## Stack
 
-The project follows a domain-driven Medallion Architecture:
+| Component | Technology |
+|---|---|
+| Compute & orchestration | Databricks |
+| Storage format | Delta Lake |
+| Source storage | AWS S3 |
+| Transformation | PySpark · SQL |
 
-Domain → Bronze → Silver → Gold
+---
 
-🔷 Layers
-	•	Bronze → Raw ingestion (no transformation)
-	•	Silver → Cleaning, validation, standardization
-	•	Gold → Business-ready data (facts & dimensions)
+## Architecture
 
-⸻
+The pipeline follows a domain-driven Medallion Architecture. Each business domain (customers, orders, products, product pricing) owns its full Bronze → Silver → Gold stack, keeping logic isolated and independently deployable.
 
-📁 Project Structure
+```
+AWS S3 (raw source files)
+        │
+        ▼
+┌──────────────────────────────────────────────────────┐
+│  BRONZE  —  raw ingestion, no transformation         │
+│  Delta format, preserves source fidelity             │
+└───────────────────────┬──────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────┐
+│  SILVER  —  cleaning, validation, standardization    │
+│  Schema enforcement · referential integrity checks   │
+│  Invalid records quarantined to separate tables      │
+└───────────────────────┬──────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────┐
+│  GOLD  —  business-ready, analytics-ready            │
+│  Fact tables · Dimension tables · Aggregated marts   │
+└──────────────────────────────────────────────────────┘
+```
 
-Setup/
-  ├── setup_catalog_schema
-  ├── setup_dim_dates
-  └── utilities
+---
 
-customer/
-orders/
-products/
-product_pricing/
+## Project Structure
 
-  ├── bronze/
-  ├── silver/
-  └── gold/
+```
+├── setup/
+│   ├── setup_catalog_schema.py       # Unity Catalog + schema initialization
+│   ├── setup_dim_dates.py            # Date dimension bootstrap
+│   └── utilities.py                  # Shared helpers
+├── customer/
+│   ├── bronze/
+│   ├── silver/
+│   └── gold/
+├── orders/
+│   ├── bronze/
+│   ├── silver/
+│   └── gold/
+├── products/
+│   ├── bronze/
+│   ├── silver/
+│   └── gold/
+└── product_pricing/
+    ├── bronze/
+    ├── silver/
+    └── gold/
+```
 
-playground/
+Each domain is fully self-contained. Shared setup logic lives separately and is invoked once at environment initialization.
 
+---
 
-⸻
+## Layer Details
 
-🔄 Data Flow
+### Bronze — ingestion
 
-1. Bronze (Ingestion)
-	•	Data ingested from AWS S3
-	•	Stored in Delta format
-	•	No transformations applied
+Raw files are read from AWS S3 and written to Delta tables with no transformations applied. Source fidelity is preserved so any downstream issue can be debugged by replaying from bronze. All domains share the same pattern: read → write Delta → done.
 
-2. Silver (Transformation)
-	•	Data cleaning & normalization
-	•	Schema enforcement
-	•	Referential integrity checks
-	•	Invalid records separated (quarantine pattern)
+### Silver — validation and standardization
 
-3. Gold (Modeling)
-	•	Fact tables (orders)
-	•	Dimension tables (customers, products)
-	•	Aggregated marts (monthly metrics)
+Three operations applied consistently across all domains:
 
-⸻
+**Schema enforcement** — explicit types cast at ingestion, rejecting malformed records rather than silently coercing them.
 
-⚙️ Incremental Processing
+**Referential integrity** — `left_anti` joins validate that foreign keys resolve correctly before records are promoted. Records that fail are written to quarantine tables (`invalid_customers`, `invalid_products`) rather than dropped, enabling auditing and root cause analysis without re-ingestion.
 
-Fact Tables
-	•	Append or insert-only merge
-	•	Grain: order_id
-	•	Idempotent ingestion
+**Deduplication** — `ROW_NUMBER()` over a defined partition key selects the latest record per entity, ensuring silver tables represent current state.
 
-Dimension Tables
-	•	Built using latest records
-	•	Uses ROW_NUMBER() for deduplication
-	•	Supports upsert (MERGE)
+### Gold — modeling
 
-⸻
+Fact and dimension tables are built from silver using standard dimensional modeling patterns.
 
-🧩 Orchestration (Key Feature)
-	•	Designed pipelines to support incremental ingestion using staging tables
-	•	Ensures:
-	•	Reliable processing
-	•	Idempotency
-	•	Controlled data movement
+**Fact table — `fact_sb_orders`**
+- Grain: one row per order event
+- Incremental strategy: append-only merge keyed on `order_id`
+- Idempotent: re-running on the same data produces the same result with no duplicates
 
-⸻
+**Dimension tables — customers, products, product pricing**
+- Built from latest silver records using `ROW_NUMBER()` deduplication
+- Upsert via `MERGE` — new records inserted, changed records updated, deletions handled by convention
 
-🛡️ Data Quality
-	•	Referential integrity validation using left_anti joins
-	•	Invalid records stored separately:
-	•	invalid_customers
-	•	invalid_products
-	•	Enables debugging, monitoring, and auditing
+**Aggregated mart**
+- Monthly sales aggregated per customer and product
+- Pre-joined and pre-aggregated for direct BI consumption
 
-⸻
+---
 
-🧱 Delta Lake Features
-	•	ACID transactions
-	•	Time travel
-	•	Schema enforcement
-	•	Change Data Feed (optional)
+## Incremental Processing
 
-⸻
+All pipelines are designed for incremental operation from the start, not retrofitted later. Staging tables act as a controlled buffer between ingestion and promotion — new records land in staging, are validated, then merged into the target. This gives three properties that matter in production:
 
-📊 Example Outputs
+- **Reliability** — failed runs leave target tables untouched; only successfully validated records are promoted
+- **Idempotency** — re-running any pipeline step on the same input produces the same output
+- **Auditability** — the path from raw S3 file to gold record is traceable at every step
 
-Fact Table
-	•	fact_sb_orders
-	•	Grain: order-level events
+---
 
-Aggregated Mart
-	•	Monthly sales per customer & product
+## Data Quality
 
-⸻
+Invalid records are not dropped — they are quarantined. Every domain that performs referential integrity checks writes failing records to a dedicated table:
 
-🛠️ Technologies Used
-	•	Databricks
-	•	PySpark
-	•	Delta Lake
-	•	AWS S3
-	•	SQL
+- `invalid_customers` — orders referencing unknown customer IDs
+- `invalid_products` — orders or pricing referencing unknown product IDs
 
-⸻
+These tables support monitoring, alerting, and upstream debugging without requiring a full re-ingestion cycle.
 
-✅ Best Practices Implemented
-	•	Domain-driven design
-	•	Medallion architecture
-	•	Incremental pipelines
-	•	Idempotent processing
-	•	Data validation & quarantine
-	•	Separation of setup and pipelines
+---
 
-⸻
+## Delta Lake Features Used
 
-🚀 Future Improvements
-	•	Add orchestration (Databricks Workflows / Airflow)
-	•	Implement data quality framework
-	•	Add monitoring & alerting
-	•	Optimize performance (partitioning, Z-order)
-	•	Introduce dbt for transformation layer
+| Feature | Purpose |
+|---|---|
+| ACID transactions | Safe concurrent reads and writes |
+| Schema enforcement | Reject malformed records at write time |
+| Time travel | Replay and audit any historical table state |
+| MERGE | Upsert support for dimension tables and idempotent fact loads |
 
-⸻
+---
 
-👤 Author
+## Gold Outputs
 
-Saugat Siwakoti
+| Table | Type | Grain |
+|---|---|---|
+| `fact_sb_orders` | Fact | Order-level events |
+| `dim_customers` | Dimension | One row per customer (current) |
+| `dim_products` | Dimension | One row per product (current) |
+| `dim_product_pricing` | Dimension | One row per pricing record (current) |
+| Monthly sales mart | Aggregated | Customer × product × month |
 
-⸻
+---
 
-🏁 Summary
+## What's Next
 
-This project demonstrates a modern data engineering system that:
-	•	Scales across domains
-	•	Ensures high data quality
-	•	Supports incremental processing
-	•	Produces analytics-ready datasets
-
-It reflects real-world data engineering practices used in production systems.
+- Databricks Workflows or Apache Airflow for end-to-end orchestration
+- Formal data quality framework (Great Expectations or Databricks DQ)
+- Monitoring and alerting on quarantine table growth
+- Partitioning and Z-ordering on high-volume fact tables
+- dbt integration for SQL-based transformation layer
